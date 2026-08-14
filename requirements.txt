@@ -1,0 +1,6 @@
+# Pinned with major-version caps to avoid a breaking/compromised new major being
+# auto-adopted on deploy. For full reproducibility run `pip freeze > requirements.lock`
+# on the working server and deploy from that.
+discord.py>=2.4,<3
+aiohttp>=3.9,<4
+python-dotenv>=1.0,<2

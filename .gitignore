@@ -1,0 +1,33 @@
+# Secrets — NEVER commit these
+.env
+*.env
+!.env.example
+
+# Bank database and its SQLite sidecars — live data, never commit
+bank.db
+bank.db-wal
+bank.db-shm
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Backups / scratch — never belong in git
+_fix_backup/
+_trim_backup/
+_to_delete/
+
+# the old empty nested repo (code lives here now)
+Osentar Bank/

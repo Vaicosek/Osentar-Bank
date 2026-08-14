@@ -31,3 +31,6 @@ _to_delete/
 
 # the old empty nested repo (code lives here now)
 Osentar Bank/
+
+# Windows shortcuts
+*.lnk

@@ -133,14 +133,51 @@ class RestockerClient:
                                    params={"user_id": str(user_id)}, retries=2)
         return data.get("holdings", [])
 
-    async def stock_buy(self, user_id, market_id: str, shares: int, *, name: str | None = None) -> dict:
-        return await self._request("POST", "/api/v1/bank/stock/buy", json={
-            "user_id": str(user_id), "market_id": market_id,
-            "shares": int(shares), "name": name,
-        })
+    #: The two trade calls, with everything core's API already accepts and this
+    #: client never sent: an idempotency key, and the bounds the user agreed to.
+    #:
+    #: Without a key these ran at `retries=0`, because a retried trade with no key
+    #: buys twice. That left the one money path where a timeout is unrecoverable:
+    #: the bank could not ask whether the trade had happened. With a key the server
+    #: dedups and replays the stored response, so a transport retry is safe.
+    #:
+    #: `quote_price` and `max_total`/`min_total` are what the user was shown and
+    #: confirmed. If the market has moved past them the engine refuses with
+    #: `slippage` BEFORE anything moves, and that code releases the key, so a
+    #: re-quote goes straight through.
 
-    async def stock_sell(self, user_id, market_id: str, shares: int, *, name: str | None = None) -> dict:
-        return await self._request("POST", "/api/v1/bank/stock/sell", json={
-            "user_id": str(user_id), "market_id": market_id,
-            "shares": int(shares), "name": name,
-        })
+    async def stock_buy(self, user_id, market_id: str, shares: int, *,
+                        name: str | None = None, idempotency_key: str | None = None,
+                        quote_price: float | None = None,
+                        max_total: int | None = None,
+                        max_slippage_bps: int | None = None) -> dict:
+        body = {"user_id": str(user_id), "market_id": market_id,
+                "shares": int(shares), "name": name}
+        if idempotency_key:
+            body["idempotency_key"] = str(idempotency_key)
+        if quote_price is not None:
+            body["quote_price"] = float(quote_price)
+        if max_total is not None:
+            body["max_total"] = int(max_total)
+        if max_slippage_bps is not None:
+            body["max_slippage_bps"] = int(max_slippage_bps)
+        return await self._request("POST", "/api/v1/bank/stock/buy", json=body,
+                                   retries=2 if idempotency_key else 0)
+
+    async def stock_sell(self, user_id, market_id: str, shares: int, *,
+                         name: str | None = None, idempotency_key: str | None = None,
+                         quote_price: float | None = None,
+                         min_total: int | None = None,
+                         max_slippage_bps: int | None = None) -> dict:
+        body = {"user_id": str(user_id), "market_id": market_id,
+                "shares": int(shares), "name": name}
+        if idempotency_key:
+            body["idempotency_key"] = str(idempotency_key)
+        if quote_price is not None:
+            body["quote_price"] = float(quote_price)
+        if min_total is not None:
+            body["min_total"] = int(min_total)
+        if max_slippage_bps is not None:
+            body["max_slippage_bps"] = int(max_slippage_bps)
+        return await self._request("POST", "/api/v1/bank/stock/sell", json=body,
+                                   retries=2 if idempotency_key else 0)

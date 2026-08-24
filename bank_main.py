@@ -17,6 +17,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+import abex_embed as ab          # the house embed builder
 import bank_db as bdb
 from restocker_client import RestockerClient, RestockerError, EXPECTED_API_VERSION
 
@@ -152,6 +153,7 @@ def fmt(n: float) -> str:
     return f"{n:,.0f}"
 
 
+
 async def ensure_account(interaction: discord.Interaction, *, write: bool = True) -> bool:
     """Return True if the user has an ACTIVE account (opted_in); otherwise
     prompt and return False. A closed account (opted_in=0) still has a row,
@@ -169,9 +171,9 @@ async def ensure_account(interaction: discord.Interaction, *, write: bool = True
         reason = (acct.get("frozen_reason") or "").strip()
         await _reply(
             interaction,
-            "🧊 Your account is frozen, so you can't move money right now."
-            + (f"\nReason: {reason}" if reason else "")
-            + "\nContact a Lead Banker.",
+            "Your account is frozen, so you can't move money right now."
+            + (f" Reason: {reason}" if reason else "")
+            + " Contact a Lead Banker.",
             error=True,
         )
         return False
@@ -197,10 +199,12 @@ def is_banker(user: discord.abc.User) -> bool:
     return bool(perms is not None and perms.administrator)
 
 
+
 async def ensure_banker(interaction: discord.Interaction) -> bool:
     if is_banker(interaction.user):
         return True
-    await _reply(interaction, "⛔ That command is for Lead Bankers only.", error=True)
+    # A refusal is a plain ephemeral line, not a red embed.
+    await _reply(interaction, "Lead Bankers only.", error=True)
     return False
 
 
@@ -224,23 +228,32 @@ def credit_limit_for(user_id) -> int:
     return max(0, min(limit, MAX_LOAN))
 
 
-def _embed(title: str, desc: str = "", color: int = 0x2ECC71) -> discord.Embed:
-    return discord.Embed(title=title, description=desc, color=color)
+
+def _embed(title: str, desc: str = "", color: int = ab.ACCENT) -> discord.Embed:
+    """Thin shim onto the house embed so every existing call site keeps working.
+
+    The bar carries one meaning, not a per-command colour: `ab.ACCENT` for
+    anything the bank asserts, `ab.GAIN` only where coins actually reach the
+    reader, `ab.LOSS` for a failure or a loss to them, `ab.NEUTRAL` for the
+    merely informational."""
+    return ab.embed(title=title, desc=desc, colour=color)
+
 
 
 async def _safe(interaction: discord.Interaction, coro):
     """Run a client coroutine, surfacing RestockerError as an ephemeral message.
     Returns the result, or None if it failed (message already sent)."""
     if client_rs is None:
-        await _reply(interaction, "⚠️ The bank isn't connected to Restocker (missing config).", error=True)
+        await _reply(interaction, "The bank isn't connected to Restocker (missing config).",
+                     error=True)
         return None
     try:
         return await coro
     except RestockerError as e:
         if e.code == "insufficient":
-            await _reply(interaction, "❌ Not enough coins in your wallet for that.", error=True)
+            await _reply(interaction, "Not enough coins in your wallet for that.", error=True)
         else:
-            await _reply(interaction, f"❌ Restocker error: {e}", error=True)
+            await _reply(interaction, f"Restocker error: {e}", error=True)
         return None
 
 
@@ -265,9 +278,10 @@ async def _get_channel(channel_id: str):
     return channel
 
 
+
 async def _post_new_account_ticket(member: discord.abc.User) -> None:
     """Post a 'new account' ticket embed to NEW_ACCOUNT_CHANNEL_ID for Lead
-    Bankers to review, with ✅/❌ reactions to mark it approved/denied.
+    Bankers to review, with reactions to mark it approved/denied.
 
     Best-effort and fire-and-forget: this never raises into the caller, so a
     missing channel/permission can't break /bank open for the user opening
@@ -277,38 +291,52 @@ async def _post_new_account_ticket(member: discord.abc.User) -> None:
         return
     try:
         channel = await _get_channel(NEW_ACCOUNT_CHANNEL_ID)
-        embed = _embed(
-            "🎫 New account — pending review",
-            f"{member.mention} (`{member.id}`) opened a bank account.\n"
-            f"Opened: {utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-            color=0x3498DB,
+        embed = ab.embed(
+            title="New account, pending review",
+            kicker="/bank open",
+            desc=f"{member.mention} (`{member.id}`) opened a bank account.",
+            groups=[("Account", ab.rows([("Member", member.mention),
+                                         ("Discord id", f"`{member.id}`"),
+                                         ("Opened", ab.when(utcnow()))]))],
+            colour=ab.ACCENT,
         )
         msg = await channel.send(embed=embed)
-        await msg.add_reaction("✅")
-        await msg.add_reaction("❌")
+        # These two reactions are the review affordance bankers click; they are
+        # message reactions, not embed copy, and Discord has no non-emoji form.
+        await msg.add_reaction("\u2705")
+        await msg.add_reaction("\u274c")
     except Exception:
         log.exception("Failed to post new-account ticket (channel %s) for user %s",
                       NEW_ACCOUNT_CHANNEL_ID, member.id)
+
 
 
 def _loan_proposal_embed(member: discord.abc.User, loan: dict, days: int,
                          history: dict, limit: int, existing_debt: float) -> discord.Embed:
     """The card Lead Bankers actually decide from — the request plus the
     borrower's track record, so the decision doesn't need a second lookup."""
-    e = _embed(
-        "📜 Loan request — awaiting approval",
-        f"{member.mention} (`{member.id}`) wants **{fmt(loan['principal'])}** {COIN} "
-        f"for **{days} days** at {LOAN_APR*100:.1f}% APR.\nLoan #{loan['id']}",
-        color=0xE67E22,
+    return ab.embed(
+        title=f"Loan request #{loan['id']}",
+        kicker="/loan request",
+        desc=(f"{member.mention} (`{member.id}`) wants {ab.coins(loan['principal'])} "
+              f"over a {days} day term at {LOAN_APR*100:.1f}% APR."),
+        band=[("Requested", ab.coins(loan["principal"])),
+              ("Term", f"{days} days"),
+              ("Existing debt", ab.coins(existing_debt))],
+        groups=[("Standing", ab.rows([
+                    ("Credit limit", ab.coins(limit)),
+                    ("Headroom", ab.coins(max(0.0, limit - existing_debt))),
+                ], strong="Credit limit")),
+                ("Track record", ab.rows([
+                    ("Loans repaid", history["repaid_count"]),
+                    ("Times late", history["late_count"]),
+                    ("Written off", history["written_off_count"]),
+                    ("Previously denied", history["denied_count"]),
+                ]))],
+        foot="No coins have moved yet. Approve to disburse.",
+        colour=ab.ACCENT,
     )
-    e.add_field(name="Existing debt", value=f"{fmt(existing_debt)} {COIN}", inline=True)
-    e.add_field(name="Credit limit", value=f"{fmt(limit)} {COIN}", inline=True)
-    e.add_field(name="Loans repaid", value=str(history["repaid_count"]), inline=True)
-    e.add_field(name="Times late", value=str(history["late_count"]), inline=True)
-    e.add_field(name="Written off", value=str(history["written_off_count"]), inline=True)
-    e.add_field(name="Previously denied", value=str(history["denied_count"]), inline=True)
-    e.set_footer(text="No coins have moved yet. Approve to disburse.")
-    return e
+
 
 
 async def _post_loan_proposal(member: discord.abc.User, loan: dict, days: int,
@@ -333,11 +361,14 @@ async def _post_loan_proposal(member: discord.abc.User, loan: dict, days: int,
                                          bdb.total_debt(member.id))
             await channel.send(embed=embed, view=LoanDecisionView(loan["id"]))
         else:
-            embed = _embed(
-                "📜 Loan issued",
-                f"{member.mention} (`{member.id}`) borrowed **{fmt(loan['principal'])}** {COIN} "
-                f"(loan #{loan['id']}).\nAPR {LOAN_APR*100:.1f}% · due in {days} days.",
-                color=0xE67E22,
+            embed = ab.embed(
+                title=f"Loan issued #{loan['id']}",
+                desc=(f"{member.mention} (`{member.id}`) borrowed "
+                      f"{ab.coins(loan['principal'])}."),
+                band=[("Principal", ab.coins(loan["principal"])),
+                      ("Term", f"{days} days"),
+                      ("APR", f"{LOAN_APR*100:.1f}%")],
+                colour=ab.ACCENT,
             )
             await channel.send(embed=embed)
     except Exception:
@@ -358,13 +389,16 @@ class LoanDecisionButton(
     Friday's redeploy.
     """
 
+
     def __init__(self, action: str, loan_id: int):
         self.action = action
         self.loan_id = int(loan_id)
+        # No emoji on the label, and the custom_id is untouched — that string is
+        # what rebuilds this button after a restart, so proposals posted before
+        # today keep working.
         super().__init__(
             discord.ui.Button(
                 label="Approve" if action == "approve" else "Deny",
-                emoji="✅" if action == "approve" else "❌",
                 style=discord.ButtonStyle.success if action == "approve" else discord.ButtonStyle.danger,
                 custom_id=f"bank:loan:{action}:{loan_id}",
             )
@@ -390,21 +424,27 @@ class LoanDecisionView(discord.ui.View):
         self.add_item(LoanDecisionButton("deny", loan_id))
 
 
+
 async def _stamp_proposal(interaction: discord.Interaction, title: str,
                           note: str, color: int) -> None:
     """Rewrite the proposal message with the verdict and strip its buttons, so
-    the channel shows what was decided and nobody can click it twice."""
+    the channel shows what was decided and nobody can click it twice.
+
+    Only the title, bar and footer change; the request's own fields stay, which
+    is what makes the stamped card still readable as a record. Nothing parses
+    these strings — the loan id rides in the button custom_id, not the title."""
     msg = getattr(interaction, "message", None)
     if msg is None:
         return
     try:
-        embed = msg.embeds[0] if msg.embeds else _embed(title)
+        embed = msg.embeds[0] if msg.embeds else ab.embed(title=title, colour=color)
         embed.title = title
         embed.colour = discord.Colour(color)
         embed.set_footer(text=note)
         await msg.edit(embed=embed, view=None)
     except Exception:
         log.exception("Failed to stamp loan proposal message %s", getattr(msg, "id", "?"))
+
 
 
 async def approve_loan(interaction: discord.Interaction, loan_id: int) -> None:
@@ -414,11 +454,11 @@ async def approve_loan(interaction: discord.Interaction, loan_id: int) -> None:
     await interaction.response.defer(ephemeral=True)
     loan = bdb.get_loan(loan_id)
     if not loan:
-        await interaction.followup.send("❌ No such loan.", ephemeral=True)
+        await interaction.followup.send("No such loan.", ephemeral=True)
         return
     if loan["status"] != "pending":
         await interaction.followup.send(
-            f"❌ Loan #{loan_id} is already **{loan['status']}** — nothing to approve.",
+            f"Loan #{loan_id} is already {loan['status']} — nothing to approve.",
             ephemeral=True)
         return
 
@@ -432,17 +472,17 @@ async def approve_loan(interaction: discord.Interaction, loan_id: int) -> None:
         loan = bdb.get_loan(loan_id)
         if not loan or loan["status"] != "pending":
             await interaction.followup.send(
-                "❌ Someone else just decided that loan.", ephemeral=True)
+                "Someone else just decided that loan.", ephemeral=True)
             return
 
         acct = bdb.get_account(borrower_id) or {}
         if not acct.get("opted_in"):
             await interaction.followup.send(
-                f"❌ Loan #{loan_id}: the borrower's account is closed.", ephemeral=True)
+                f"Loan #{loan_id}: the borrower's account is closed.", ephemeral=True)
             return
         if acct.get("frozen"):
             await interaction.followup.send(
-                f"❌ Loan #{loan_id}: the borrower's account is frozen. Unfreeze it first.",
+                f"Loan #{loan_id}: the borrower's account is frozen. Unfreeze it first.",
                 ephemeral=True)
             return
 
@@ -452,13 +492,13 @@ async def approve_loan(interaction: discord.Interaction, loan_id: int) -> None:
         debt = bdb.total_debt(borrower_id)
         if debt + principal > limit:
             await interaction.followup.send(
-                f"⚠️ Loan #{loan_id} would put them at {fmt(debt + principal)} {COIN} against a "
-                f"{fmt(limit)} {COIN} limit. Raise it with `/admin creditlimit` or deny.",
+                f"Loan #{loan_id} would put them at {ab.coins(debt + principal)} against a "
+                f"{ab.coins(limit)} limit. Raise it with `/admin creditlimit` or deny.",
                 ephemeral=True)
             return
 
         if not bdb.claim_pending_loan(loan_id, interaction.user.id):
-            await interaction.followup.send("❌ Someone else just decided that loan.", ephemeral=True)
+            await interaction.followup.send("Someone else just decided that loan.", ephemeral=True)
             return
 
         days = int(loan["term_days"] or DEFAULT_LOAN_DAYS)
@@ -485,39 +525,47 @@ async def approve_loan(interaction: discord.Interaction, loan_id: int) -> None:
 
     bdb.log(borrower_id, "loan_out", principal, f"loan #{loan_id} {days}d approved by {interaction.user.id}")
 
+    due_dt = _parse_iso(due)
     await interaction.followup.send(
-        f"✅ Approved loan #{loan_id} — **{fmt(principal)}** {COIN} disbursed.", ephemeral=True)
+        f"Approved loan #{loan_id} — {ab.coins(principal)} disbursed over a {days} day term.",
+        ephemeral=True)
     await _stamp_proposal(
-        interaction, "✅ Loan approved",
-        f"Approved by {interaction.user.display_name} · due {due[:10]}", 0x2ECC71)
-    asyncio.create_task(_log_activity(
-        f"✅ Loan #{loan_id} — **{fmt(principal)}** {COIN} to <@{borrower_id}>, "
-        f"approved by {interaction.user.mention}. Due in {days}d."))
+        interaction, f"Loan approved #{loan_id}",
+        f"Approved by {interaction.user.display_name} · {days} day term, due {due[:10]}",
+        ab.ACCENT)
+    asyncio.create_task(_log_activity(ab.line(
+        "Loan approved", f"#{loan_id}", ab.coins(principal), f"to <@{borrower_id}>",
+        f"{days} day term", f"due {ab.when(due_dt)}" if due_dt else "",
+        f"approved by {interaction.user.mention}")))
+
 
 
 async def deny_loan(interaction: discord.Interaction, loan_id: int) -> None:
     await interaction.response.defer(ephemeral=True)
     loan = bdb.get_loan(loan_id)
     if not loan:
-        await interaction.followup.send("❌ No such loan.", ephemeral=True)
+        await interaction.followup.send("No such loan.", ephemeral=True)
         return
     if loan["status"] != "pending":
         await interaction.followup.send(
-            f"❌ Loan #{loan_id} is already **{loan['status']}**.", ephemeral=True)
+            f"Loan #{loan_id} is already {loan['status']}.", ephemeral=True)
         return
     if not bdb.deny_loan(loan_id, interaction.user.id):
-        await interaction.followup.send("❌ Someone else just decided that loan.", ephemeral=True)
+        await interaction.followup.send("Someone else just decided that loan.", ephemeral=True)
         return
-    await interaction.followup.send(f"❌ Denied loan #{loan_id}.", ephemeral=True)
-    await _stamp_proposal(interaction, "❌ Loan denied",
-                          f"Denied by {interaction.user.display_name}", 0xE74C3C)
-    asyncio.create_task(_log_activity(
-        f"❌ Loan #{loan_id} for <@{loan['user_id']}> denied by {interaction.user.mention}."))
+    await interaction.followup.send(f"Denied loan #{loan_id}.", ephemeral=True)
+    await _stamp_proposal(interaction, f"Loan denied #{loan_id}",
+                          f"Denied by {interaction.user.display_name}", ab.LOSS)
+    asyncio.create_task(_log_activity(ab.line(
+        "Loan denied", f"#{loan_id}", f"for <@{loan['user_id']}>",
+        f"denied by {interaction.user.mention}")))
+
 
 
 async def _log_activity(text: str) -> None:
-    """Post one audit-trail line to BOT_LOG_CHANNEL_ID. Best-effort/fire-and-
-    forget — failures are only logged, never surfaced to the user."""
+    """Post one audit-trail line to BOT_LOG_CHANNEL_ID. One event, one line, no
+    embed — the compact feed shape. Best-effort/fire-and-forget: failures are
+    only logged, never surfaced to the user."""
     if not BOT_LOG_CHANNEL_ID:
         return
     try:
@@ -532,23 +580,23 @@ bank_group = app_commands.Group(name="bank", description="Your bank account")
 
 
 @bank_group.command(name="open", description="Open a bank account")
+
 async def bank_open(interaction: discord.Interaction):
     is_new = bdb.get_account(interaction.user.id) is None
     bdb.open_account(interaction.user.id, interaction.user.display_name)
     if is_new:
-        desc = (f"Your bank account is open, **{interaction.user.display_name}**.\n"
-                f"Try `/bank deposit`, `/loan request`, or `/invest list`.")
+        # One fact, one line — a fresh account does not need an embed.
+        msg = ("Your bank account is open. Try `/bank deposit`, `/loan request`, "
+               "or `/invest list`.")
     else:
-        desc = f"Welcome back — your account is active, **{interaction.user.display_name}**."
-    await interaction.response.send_message(
-        embed=_embed("🏦 Account ready", desc),
-        ephemeral=True,
-    )
+        msg = "Welcome back — your account is active."
+    await interaction.response.send_message(msg, ephemeral=True)
     if is_new:
         asyncio.create_task(_post_new_account_ticket(interaction.user))
 
 
 @bank_group.command(name="balance", description="See your wallet, savings, and debt")
+
 async def bank_balance(interaction: discord.Interaction):
     if not await ensure_account(interaction, write=False):
         return
@@ -560,18 +608,25 @@ async def bank_balance(interaction: discord.Interaction):
     debt = bdb.total_debt(interaction.user.id)
     bonds = bdb.total_bonds_value(interaction.user.id)
     net = wallet["coins"] + sav + bonds - debt
-    e = _embed(f"🏦 {interaction.user.display_name}'s bank")
-    e.add_field(name="Wallet", value=f"{fmt(wallet['coins'])} {COIN}", inline=True)
-    e.add_field(name="Savings", value=f"{fmt(sav)} {COIN}", inline=True)
-    e.add_field(name="Bonds (at maturity)", value=f"{fmt(bonds)} {COIN}", inline=True)
-    e.add_field(name="Debt", value=f"{fmt(debt)} {COIN}", inline=True)
-    e.add_field(name="Net worth", value=f"**{fmt(net)}** {COIN}", inline=False)
-    e.set_footer(text=f"Savings APR {SAVINGS_APR*100:.1f}% · Loan APR {LOAN_APR*100:.1f}%")
+    e = ab.embed(
+        title="Your bank",
+        kicker="/bank balance",
+        band=[("Wallet", ab.coins(wallet["coins"])),
+              ("Savings", ab.coins(sav)),
+              ("Debt", ab.coins(debt))],
+        groups=[("Position", ab.rows([
+            ("Bonds, value at maturity", ab.coins(bonds)),
+            ("Net worth", ab.coins(net)),
+        ], strong="Net worth"))],
+        foot=f"Savings APR {SAVINGS_APR*100:.1f}% · Loan APR {LOAN_APR*100:.1f}%",
+        colour=ab.ACCENT,
+    )
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
 @bank_group.command(name="deposit", description="Move coins from your wallet into savings")
 @app_commands.describe(amount="How many coins to deposit")
+
 async def bank_deposit(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100_000_000]):
     if not await ensure_account(interaction):
         return
@@ -582,18 +637,21 @@ async def bank_deposit(interaction: discord.Interaction, amount: app_commands.Ra
     new_sav = bdb.add_savings(interaction.user.id, amount)
     bdb.log(interaction.user.id, "deposit", amount, "wallet->savings")
     await interaction.followup.send(
-        embed=_embed("💰 Deposit complete",
-                     f"Moved **{fmt(amount)}** {COIN} into savings.\n"
-                     f"Savings balance: **{fmt(new_sav)}** {COIN}\n"
-                     f"Wallet: {fmt(res['coins'])} {COIN}"),
+        embed=ab.embed(title="Deposit complete",
+                       kicker="/bank deposit",
+                       desc=f"Moved {ab.coins(amount)} from your wallet into savings.",
+                       band=[("Savings", ab.coins(new_sav)),
+                             ("Wallet", ab.coins(res["coins"]))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"💰 {interaction.user.mention} deposited **{fmt(amount)}** {COIN} into savings."))
+    asyncio.create_task(_log_activity(ab.line(
+        "Deposit", interaction.user.mention, ab.coins(amount), "into savings")))
 
 
 @bank_group.command(name="withdraw", description="Move coins from savings back to your wallet")
 @app_commands.describe(amount="How many coins to withdraw")
+
 async def bank_withdraw(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100_000_000]):
     if not await ensure_account(interaction):
         return
@@ -601,7 +659,7 @@ async def bank_withdraw(interaction: discord.Interaction, amount: app_commands.R
     if not bdb.try_debit_savings(interaction.user.id, amount):
         sav = bdb.get_savings(interaction.user.id)["balance"]
         await interaction.followup.send(
-            f"❌ You only have {fmt(sav)} {COIN} in savings.", ephemeral=True)
+            f"You only have {ab.coins(sav)} in savings.", ephemeral=True)
         return
     res = await _safe(interaction, client_rs.adjust(interaction.user.id, amount, reason="bank withdraw"))
     if res is None:
@@ -610,18 +668,22 @@ async def bank_withdraw(interaction: discord.Interaction, amount: app_commands.R
     new_sav = bdb.get_savings(interaction.user.id)["balance"]
     bdb.log(interaction.user.id, "withdraw", amount, "savings->wallet")
     await interaction.followup.send(
-        embed=_embed("🏧 Withdrawal complete",
-                     f"Moved **{fmt(amount)}** {COIN} to your wallet.\n"
-                     f"Savings balance: **{fmt(new_sav)}** {COIN}\n"
-                     f"Wallet: {fmt(res['coins'])} {COIN}"),
+        # Green: coins actually reached the reader's wallet.
+        embed=ab.embed(title="Withdrawal complete",
+                       kicker="/bank withdraw",
+                       desc=f"Moved {ab.coins(amount)} from savings to your wallet.",
+                       band=[("Savings", ab.coins(new_sav)),
+                             ("Wallet", ab.coins(res["coins"]))],
+                       colour=ab.GAIN),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"🏧 {interaction.user.mention} withdrew **{fmt(amount)}** {COIN} from savings."))
+    asyncio.create_task(_log_activity(ab.line(
+        "Withdrawal", interaction.user.mention, ab.coins(amount), "from savings")))
 
 
 @bank_group.command(name="transfer", description="Send coins from your wallet to another member")
 @app_commands.describe(member="Who to pay", amount="How many coins")
+
 async def bank_transfer(interaction: discord.Interaction, member: discord.Member,
                         amount: app_commands.Range[int, 1, 100_000_000]):
     if not await ensure_account(interaction):
@@ -640,16 +702,25 @@ async def bank_transfer(interaction: discord.Interaction, member: discord.Member
     bdb.log(interaction.user.id, "transfer_out", amount, f"to {member.id}")
     bdb.log(str(member.id), "transfer_in", amount, f"from {interaction.user.id}")
     await interaction.followup.send(
-        embed=_embed("📤 Payment sent",
-                     f"Sent **{fmt(amount)}** {COIN} to {member.mention}.\n"
-                     f"Your wallet: {fmt(res['from']['coins'])} {COIN}"),
+        embed=ab.embed(title="Payment sent",
+                       kicker="/bank transfer",
+                       desc=f"Sent {ab.coins(amount)} to {member.mention}.",
+                       band=[("Your wallet", ab.coins(res["from"]["coins"]))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"📤 {interaction.user.mention} sent **{fmt(amount)}** {COIN} to {member.mention}."))
+    asyncio.create_task(_log_activity(ab.line(
+        "Payment", f"{interaction.user.mention} to {member.mention}", ab.coins(amount))))
+
+
+
+def _kind_words(kind) -> str:
+    """`transfer_in` -> `transfer in`. A ledger kind is an internal id."""
+    return str(kind or "").replace("_", " ").strip() or "entry"
 
 
 @bank_group.command(name="history", description="Your recent bank activity")
+
 async def bank_history(interaction: discord.Interaction):
     if not await ensure_account(interaction, write=False):
         return
@@ -665,15 +736,22 @@ async def bank_history(interaction: discord.Interaction):
     for r in rows:
         ts = r["ts"][:16].replace("T", " ")
         if r["kind"] in NON_MONETARY:
-            lines.append(f"`{ts}`  {r['kind']}")
+            lines.append(ab.line(ts, _kind_words(r["kind"])))
             continue
         if r["kind"] == "admin_savings_adjust":
-            sign = "+" if r["amount"] >= 0 else "-"   # the amount itself carries the direction
+            sign = 1 if r["amount"] >= 0 else -1   # the amount itself carries the direction
         else:
-            sign = "+" if r["kind"] in GAINS else "-"
-        lines.append(f"`{ts}`  {r['kind']:<20} {sign}{fmt(abs(r['amount']))} {COIN}")
+            sign = 1 if r["kind"] in GAINS else -1
+        lines.append(ab.line(ts, _kind_words(r["kind"]),
+                             ab.signed(sign * abs(r["amount"]))))
+    # One line per event, the shape John accepted for feeds. The padded monospace
+    # block this replaced is the thing `abex_embed`'s own docstring rejects: it
+    # wraps at 380px, and a column of :<20 padding is a table drawn by hand.
+    body = "\n".join(lines)[:3800]
     await interaction.response.send_message(
-        embed=_embed("📒 Recent activity", "\n".join(lines)), ephemeral=True)
+        embed=ab.embed(title="Recent activity", kicker="/bank history",
+                       desc=body, colour=ab.NEUTRAL),
+        ephemeral=True)
 
 
 class _CloseAccountConfirm(discord.ui.View):
@@ -693,6 +771,8 @@ class _CloseAccountConfirm(discord.ui.View):
         return True
 
     @discord.ui.button(label="Close my account", style=discord.ButtonStyle.danger)
+
+    @discord.ui.button(label="Close my account", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.confirmed = True
         self.stop()
@@ -710,31 +790,33 @@ class _CloseAccountConfirm(discord.ui.View):
 
 
 @bank_group.command(name="close", description="Close (delete) your bank account")
+
 async def bank_close(interaction: discord.Interaction):
     if not await ensure_account(interaction):
         return
     debt = bdb.total_debt(interaction.user.id)
     if debt > 0:
         await interaction.response.send_message(
-            f"❌ You still owe **{fmt(debt)}** {COIN}. Repay with `/loan repay` before closing your account.",
-            ephemeral=True)
+            f"You still owe {ab.coins(debt)}. Repay with `/loan repay` before closing "
+            f"your account.", ephemeral=True)
         return
     active_bonds = bdb.get_bonds(interaction.user.id, "active")
     if active_bonds:
         await interaction.response.send_message(
-            f"❌ You have {len(active_bonds)} active bond(s). Redeem them with `/bond redeem` "
-            f"before closing your account.",
-            ephemeral=True)
+            f"You have {len(active_bonds)} active bond(s). Redeem them with `/bond redeem` "
+            f"before closing your account.", ephemeral=True)
         return
 
     sav = bdb.get_savings(interaction.user.id)["balance"]
-    cashout_note = f"This will move **{fmt(sav)}** {COIN} from savings to your wallet and " if sav > 0 else "This will "
+    cashout_note = (f"This moves {ab.coins(sav)} from savings to your wallet and "
+                    if sav > 0 else "This ")
     view = _CloseAccountConfirm(interaction.user.id)
     await interaction.response.send_message(
-        embed=_embed("⚠️ Close your bank account?",
-                     f"{cashout_note}deactivate your bank account.\n"
-                     f"Your history isn't deleted — `/bank open` reopens it any time.",
-                     color=0xE74C3C),
+        embed=ab.embed(title="Close your bank account?",
+                       kicker="/bank close",
+                       desc=(f"{cashout_note}deactivates your bank account. Your history "
+                             f"isn't deleted — `/bank open` reopens it any time."),
+                       colour=ab.LOSS),
         view=view,
         ephemeral=True,
     )
@@ -753,14 +835,13 @@ async def bank_close(interaction: discord.Interaction):
     bdb.close_account(interaction.user.id)
     bdb.log(interaction.user.id, "account_closed", 0, "")
     await interaction.followup.send(
-        embed=_embed("🔒 Account closed",
-                     "Your bank account is now closed."
-                     + (f" **{fmt(sav)}** {COIN} was moved to your wallet." if sav > 0 else "")),
+        "Your bank account is now closed."
+        + (f" {ab.coins(sav)} was moved to your wallet." if sav > 0 else ""),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"🔒 {interaction.user.mention} closed their bank account."
-        + (f" Cashed out **{fmt(sav)}** {COIN} from savings." if sav > 0 else "")))
+    asyncio.create_task(_log_activity(ab.line(
+        "Account closed", interaction.user.mention,
+        f"cashed out {ab.coins(sav)} from savings" if sav > 0 else "")))
 
 
 
@@ -781,25 +862,26 @@ async def loan_request(interaction: discord.Interaction,
         return await _do_loan_request(interaction, amount, days)
 
 
+
 async def _do_loan_request(interaction: discord.Interaction, amount: int, days: int):
     current_debt = bdb.total_debt(interaction.user.id)
     limit = credit_limit_for(interaction.user.id)
     if limit <= 0:
         await interaction.followup.send(
-            "❌ Your credit limit is **0** — the bank isn't lending to you right now. "
+            "Your credit limit is 0 — the bank isn't lending to you right now. "
             "Talk to a Lead Banker.", ephemeral=True)
         return
     if current_debt + amount > limit:
         await interaction.followup.send(
-            f"❌ That would put your debt at {fmt(current_debt + amount)} {COIN}, over your "
-            f"**{fmt(limit)}** {COIN} credit limit (current debt {fmt(current_debt)} {COIN}).\n"
+            f"That would put your debt at {ab.coins(current_debt + amount)}, over your "
+            f"{ab.coins(limit)} credit limit (current debt {ab.coins(current_debt)}). "
             f"Your limit grows as you repay loans on time.", ephemeral=True)
         return
 
     pending = bdb.get_pending_loans(interaction.user.id)
     if LOAN_REQUIRE_APPROVAL and len(pending) >= MAX_PENDING_LOANS:
         await interaction.followup.send(
-            f"❌ You already have {len(pending)} loan request awaiting approval "
+            f"You already have {len(pending)} loan request awaiting approval "
             f"(#{pending[0]['id']}). Wait for a decision first.", ephemeral=True)
         return
 
@@ -809,12 +891,15 @@ async def _do_loan_request(interaction: discord.Interaction, amount: int, days: 
         loan = bdb.create_loan(interaction.user.id, float(amount), LOAN_APR, None,
                                status="pending", term_days=days)
         await interaction.followup.send(
-            embed=_embed("🕒 Loan request submitted",
-                         f"Requested **{fmt(amount)}** {COIN} for **{days} days** "
-                         f"(request #{loan['id']}).\n"
-                         f"A Lead Banker has to approve it — nothing has been paid out yet. "
-                         f"Check with `/loan status`.",
-                         color=0xF1C40F),
+            embed=ab.embed(title=f"Loan request #{loan['id']} submitted",
+                           kicker="/loan request",
+                           desc=(f"Requested {ab.coins(amount)} over a {days} day term. "
+                                 f"A Lead Banker has to approve it — nothing has been paid "
+                                 f"out yet. Check with `/loan status`."),
+                           band=[("Requested", ab.coins(amount)),
+                                 ("Term", f"{days} days"),
+                                 ("APR", f"{LOAN_APR*100:.1f}%")],
+                           colour=ab.NEUTRAL),
             ephemeral=True,
         )
         asyncio.create_task(_post_loan_proposal(interaction.user, loan, days, pending=True))
@@ -827,12 +912,21 @@ async def _do_loan_request(interaction: discord.Interaction, amount: int, days: 
     due = (utcnow() + timedelta(days=days)).isoformat()
     loan = bdb.create_loan(interaction.user.id, float(amount), LOAN_APR, due, term_days=days)
     bdb.log(interaction.user.id, "loan_out", amount, f"loan #{loan['id']} {days}d")
+    due_dt = _parse_iso(due)
     await interaction.followup.send(
-        embed=_embed("📈 Loan approved",
-                     f"Borrowed **{fmt(amount)}** {COIN} (loan #{loan['id']}).\n"
-                     f"APR {LOAN_APR*100:.1f}% · due in {days} days.\n"
-                     f"Repay with `/loan repay`. Wallet: {fmt(res['coins'])} {COIN}",
-                     color=0xE67E22),
+        # Green: the principal has actually reached their wallet.
+        embed=ab.embed(title=f"Loan approved #{loan['id']}",
+                       kicker="/loan request",
+                       desc=(f"Borrowed {ab.coins(amount)} over a {days} day term at "
+                             f"{LOAN_APR*100:.1f}% APR. Repay with `/loan repay`."),
+                       band=[("Principal", ab.coins(amount)),
+                             ("Term", f"{days} days"),
+                             ("Wallet", ab.coins(res["coins"]))],
+                       groups=[("Repayment", ab.rows([
+                           ("Due", ab.when(due_dt) if due_dt else due[:10]),
+                           ("APR", f"{LOAN_APR*100:.1f}%"),
+                       ]))],
+                       colour=ab.GAIN),
         ephemeral=True,
     )
     asyncio.create_task(_post_loan_proposal(interaction.user, loan, days, pending=False))
@@ -840,6 +934,7 @@ async def _do_loan_request(interaction: discord.Interaction, amount: int, days: 
 
 @loan_group.command(name="repay", description="Repay your loans from your wallet")
 @app_commands.describe(amount="How many coins to repay")
+
 async def loan_repay(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100_000_000]):
     if not await ensure_account(interaction):
         return
@@ -847,7 +942,7 @@ async def loan_repay(interaction: discord.Interaction, amount: app_commands.Rang
     async with _user_lock(interaction.user.id):
         loans = bdb.get_active_loans(interaction.user.id)
         if not loans:
-            await interaction.followup.send("You have no active loans. 🎉", ephemeral=True)
+            await interaction.followup.send("You have no active loans.", ephemeral=True)
             return
         debt = sum(float(l["balance"]) for l in loans)
         pay = min(amount, math.ceil(debt))
@@ -864,18 +959,21 @@ async def loan_repay(interaction: discord.Interaction, amount: app_commands.Rang
         bdb.log(interaction.user.id, "loan_repay", pay, "repayment")
         new_debt = bdb.total_debt(interaction.user.id)
     await interaction.followup.send(
-        embed=_embed("✅ Repayment applied",
-                     f"Repaid **{fmt(pay)}** {COIN}.\n"
-                     f"Remaining debt: **{fmt(new_debt)}** {COIN}\n"
-                     f"Wallet: {fmt(res['coins'])} {COIN}"),
+        embed=ab.embed(title="Repayment applied",
+                       kicker="/loan repay",
+                       desc=f"Repaid {ab.coins(pay)} from your wallet.",
+                       band=[("Remaining debt", ab.coins(new_debt)),
+                             ("Wallet", ab.coins(res["coins"]))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"✅ {interaction.user.mention} repaid **{fmt(pay)}** {COIN}. "
-        f"Remaining debt: {fmt(new_debt)} {COIN}."))
+    asyncio.create_task(_log_activity(ab.line(
+        "Repayment", interaction.user.mention, ab.coins(pay),
+        f"remaining debt {ab.coins(new_debt)}")))
 
 
 @loan_group.command(name="status", description="See your outstanding loans")
+
 async def loan_status(interaction: discord.Interaction):
     if not await ensure_account(interaction, write=False):
         return
@@ -883,35 +981,46 @@ async def loan_status(interaction: discord.Interaction):
     pending = bdb.get_pending_loans(interaction.user.id)
     limit = credit_limit_for(interaction.user.id)
     if not loans and not pending:
+        # Nothing outstanding is one fact: one plain line, no embed.
         await interaction.response.send_message(
-            f"No active loans. 🎉\nYou can borrow up to **{fmt(limit)}** {COIN}.", ephemeral=True)
+            f"No active loans. You can borrow up to {ab.coins(limit)}.", ephemeral=True)
         return
-    lines = []
-    for p in pending:
-        lines.append(f"#{p['id']}: **{fmt(p['principal'])}** {COIN} — 🕒 *awaiting approval "
-                     f"({p['term_days']}d)*")
-    if pending and loans:
-        lines.append("")
+
+    groups = []
+    if pending:
+        # Every loan figure states its term.
+        groups.append(("Awaiting approval", ab.rows(
+            [(f"#{p['id']} · {p['term_days']} day term", ab.coins(p["principal"]))
+             for p in pending])))
+
     overdue_any = False
+    active_rows = []
     for l in loans:
         due_raw = l["due_at"] or ""
-        due = due_raw[:10]
         d = _parse_iso(due_raw)
         is_overdue = bool(d and utcnow() > d)
         overdue_any = overdue_any or is_overdue
-        tag = " ⚠️ **OVERDUE**" if is_overdue else ""
-        lines.append(f"#{l['id']}: **{fmt(l['balance'])}** {COIN} owed "
-                     f"(borrowed {fmt(l['principal'])}, APR {l['apr']*100:.1f}%, due {due}){tag}")
-    if overdue_any:
-        lines.append(f"\n⚠️ Overdue loans accrue an extra {LOAN_OVERDUE_EXTRA_APR*100:.0f}% APR until repaid.")
+        term = f"{l['term_days']} day term" if l.get("term_days") else "term not recorded"
+        when_txt = ab.when(d) if d else (due_raw[:10] or "no due date")
+        label = f"#{l['id']} · {term} · due {when_txt}" + (" · overdue" if is_overdue else "")
+        active_rows.append((label,
+                            f"{ab.coins(l['balance'])} owed of {ab.coins(l['principal'])} "
+                            f"borrowed at {l['apr']*100:.1f}% APR"))
+    if active_rows:
+        groups.append(("Active loans", ab.rows(active_rows)))
+
     total = bdb.total_debt(interaction.user.id)
+    foot = (f"Overdue loans accrue an extra {LOAN_OVERDUE_EXTRA_APR*100:.0f}% APR until repaid."
+            if overdue_any else "")
     await interaction.response.send_message(
-        embed=_embed("📋 Your loans",
-                     "\n".join(lines)
-                     + f"\n\n**Total debt: {fmt(total)} {COIN}**"
-                     + f"\nCredit limit: {fmt(limit)} {COIN} "
-                       f"(headroom {fmt(max(0, limit - total))} {COIN})",
-                     color=0xE67E22),
+        embed=ab.embed(title="Your loans",
+                       kicker="/loan status",
+                       band=[("Total debt", ab.coins(total)),
+                             ("Credit limit", ab.coins(limit)),
+                             ("Headroom", ab.coins(max(0, limit - total)))],
+                       groups=groups,
+                       foot=foot,
+                       colour=ab.LOSS if overdue_any else ab.ACCENT),
         ephemeral=True,
     )
 
@@ -921,13 +1030,17 @@ savings_group = app_commands.Group(name="savings", description="Savings info")
 
 
 @savings_group.command(name="rate", description="See current savings & loan rates")
+
 async def savings_rate(interaction: discord.Interaction):
     daily = SAVINGS_APR / 365
     await interaction.response.send_message(
-        embed=_embed("💹 Rates",
-                     f"**Savings APR:** {SAVINGS_APR*100:.2f}% (~{daily*100:.4f}%/day, compounded daily)\n"
-                     f"**Loan APR:** {LOAN_APR*100:.2f}%\n"
-                     f"Interest is applied once every 24h."),
+        embed=ab.embed(title="Rates",
+                       kicker="/savings rate",
+                       band=[("Savings APR", f"{SAVINGS_APR*100:.2f}%"),
+                             ("Loan APR", f"{LOAN_APR*100:.2f}%"),
+                             ("Daily on savings", f"{daily*100:.4f}%")],
+                       foot="Compounded daily. Interest is applied once every 24 hours.",
+                       colour=ab.NEUTRAL),
         ephemeral=True,
     )
 
@@ -936,28 +1049,36 @@ async def savings_rate(interaction: discord.Interaction):
 bond_group = app_commands.Group(name="bond", description="Lock coins in fixed-term bonds for higher interest")
 
 
+
 async def _term_autocomplete(interaction: discord.Interaction, current: str):
     out = []
     for days, apr in BOND_TERMS.items():
         out.append(app_commands.Choice(
-            name=f"{days} days — {apr*100:.1f}% APR", value=days))
+            name=f"{days} day term — {apr*100:.1f}% APR", value=days))
     return out[:25]
 
 
 @bond_group.command(name="rates", description="See available bond terms and rates")
+
 async def bond_rates(interaction: discord.Interaction):
     if not BOND_TERMS:
         await interaction.response.send_message("No bond products are configured.", ephemeral=True)
         return
-    lines = []
+    rows = []
     for days, apr in BOND_TERMS.items():
         ex = _bond_payout(1000, apr, days)
-        lines.append(f"**{days} days** — {apr*100:.1f}% APR · 1,000 {COIN} → **{fmt(ex)}** {COIN} at maturity")
-    note = ("\nEarly redemption returns your principal"
+        # Every bond figure states its term.
+        rows.append((f"{days} day term",
+                     f"{apr*100:.1f}% APR · {ab.coins(1000)} becomes {ab.coins(ex)} at maturity"))
+    note = ("Early redemption returns your principal"
             + (f" minus a {BOND_EARLY_PENALTY_PCT*100:.0f}% penalty" if BOND_EARLY_PENALTY_PCT else "")
             + " but forfeits the interest.")
     await interaction.response.send_message(
-        embed=_embed("📜 Bond rates", "\n".join(lines) + note, color=0x9B59B6),
+        embed=ab.embed(title="Bond rates",
+                       kicker="/bond rates",
+                       groups=[("Terms", ab.rows(rows))],
+                       foot=note,
+                       colour=ab.NEUTRAL),
         ephemeral=True,
     )
 
@@ -965,15 +1086,16 @@ async def bond_rates(interaction: discord.Interaction):
 @bond_group.command(name="buy", description="Lock coins into a fixed-term bond")
 @app_commands.describe(amount="How many coins to lock", term="Bond term")
 @app_commands.autocomplete(term=_term_autocomplete)
+
 async def bond_buy(interaction: discord.Interaction,
                    amount: app_commands.Range[int, 1, 100_000_000],
                    term: int):
     if not await ensure_account(interaction):
         return
     if term not in BOND_TERMS:
-        avail = ", ".join(f"{d}d" for d in BOND_TERMS) or "none"
+        avail = ", ".join(f"{d} days" for d in BOND_TERMS) or "none"
         await interaction.response.send_message(
-            f"❌ `{term}` isn't an available term. Available: {avail}. See `/bond rates`.",
+            f"{term} isn't an available term. Available: {avail}. See `/bond rates`.",
             ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
@@ -985,21 +1107,29 @@ async def bond_buy(interaction: discord.Interaction,
     matures = (utcnow() + timedelta(days=term)).isoformat()
     bond = bdb.create_bond(interaction.user.id, float(amount), apr, term, float(payout), matures)
     bdb.log(interaction.user.id, "bond_buy", amount, f"bond #{bond['id']} {term}d")
+    matures_dt = _parse_iso(matures)
     await interaction.followup.send(
-        embed=_embed("📜 Bond purchased",
-                     f"Locked **{fmt(amount)}** {COIN} for **{term} days** at {apr*100:.1f}% APR "
-                     f"(bond #{bond['id']}).\n"
-                     f"Matures {matures[:10]} → pays out **{fmt(payout)}** {COIN}.\n"
-                     f"Wallet: {fmt(res['coins'])} {COIN}",
-                     color=0x9B59B6),
+        embed=ab.embed(title=f"Bond bought #{bond['id']}",
+                       kicker="/bond buy",
+                       desc=(f"Locked {ab.coins(amount)} for a {term} day term at "
+                             f"{apr*100:.1f}% APR."),
+                       band=[("Term", f"{term} days"),
+                             ("Pays out", ab.coins(payout)),
+                             ("Wallet", ab.coins(res["coins"]))],
+                       groups=[("Maturity", ab.rows([
+                           ("Matures", ab.when(matures_dt) if matures_dt else matures[:10]),
+                           ("Payout at maturity", ab.coins(payout)),
+                       ], strong="Payout at maturity"))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
-    asyncio.create_task(_log_activity(
-        f"📜 {interaction.user.mention} bought a {term}-day bond for **{fmt(amount)}** {COIN} "
-        f"(bond #{bond['id']})."))
+    asyncio.create_task(_log_activity(ab.line(
+        "Bond bought", f"#{bond['id']}", interaction.user.mention, ab.coins(amount),
+        f"{term} day term")))
 
 
 @bond_group.command(name="list", description="See your bonds")
+
 async def bond_list(interaction: discord.Interaction):
     if not await ensure_account(interaction, write=False):
         return
@@ -1009,33 +1139,40 @@ async def bond_list(interaction: discord.Interaction):
             "You have no active bonds. Buy one with `/bond buy`.", ephemeral=True)
         return
     now = utcnow()
-    lines = []
+    rows = []
     for b in bonds:
         matured = now.isoformat() >= b["matures_at"]
-        flag = "✅ **MATURED — redeem now**" if matured else f"matures {b['matures_at'][:10]}"
-        lines.append(f"#{b['id']}: {fmt(b['principal'])} {COIN} @ {b['apr']*100:.1f}% "
-                     f"({b['term_days']}d) → {fmt(b['payout'])} {COIN} · {flag}")
+        m_dt = _parse_iso(b["matures_at"])
+        when_txt = ("matured, redeem now" if matured
+                    else f"matures {ab.when(m_dt) if m_dt else b['matures_at'][:10]}")
+        rows.append((f"#{b['id']} · {b['term_days']} day term · {when_txt}",
+                     f"{ab.coins(b['principal'])} at {b['apr']*100:.1f}% APR "
+                     f"pays {ab.coins(b['payout'])}"))
     locked = bdb.total_bonds_value(interaction.user.id)
     await interaction.response.send_message(
-        embed=_embed("📜 Your bonds",
-                     "\n".join(lines) + f"\n\n**Value at maturity: {fmt(locked)} {COIN}**",
-                     color=0x9B59B6),
+        embed=ab.embed(title="Your bonds",
+                       kicker="/bond list",
+                       band=[("Value at maturity", ab.coins(locked)),
+                             ("Bonds held", str(len(bonds)))],
+                       groups=[("Bonds", ab.rows(rows))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
 
 
 @bond_group.command(name="redeem", description="Redeem a bond (full payout if matured, principal if early)")
 @app_commands.describe(bond_id="The bond number from /bond list")
+
 async def bond_redeem(interaction: discord.Interaction, bond_id: int):
     if not await ensure_account(interaction):
         return
     await interaction.response.defer(ephemeral=True)
     bond = bdb.get_bond(bond_id)
     if not bond or str(bond["user_id"]) != str(interaction.user.id):
-        await interaction.followup.send("❌ That bond isn't yours or doesn't exist.", ephemeral=True)
+        await interaction.followup.send("That bond isn't yours or doesn't exist.", ephemeral=True)
         return
     if bond["status"] != "active":
-        await interaction.followup.send("❌ That bond has already been redeemed.", ephemeral=True)
+        await interaction.followup.send("That bond has already been redeemed.", ephemeral=True)
         return
 
     now = utcnow()
@@ -1047,7 +1184,8 @@ async def bond_redeem(interaction: discord.Interaction, bond_id: int):
         principal = int(round(bond["principal"]))
         penalty = int(round(principal * BOND_EARLY_PENALTY_PCT))
         amount = max(0, principal - penalty)
-        kind_note = f"early redemption (interest forfeited{f', −{fmt(penalty)} penalty' if penalty else ''})"
+        kind_note = ("early redemption, interest forfeited"
+                     + (f", {ab.coins(penalty)} penalty" if penalty else ""))
 
     # Everything below runs under the user's lock. The split between "goes to
     # debt" and "goes to the wallet" is decided before an HTTP round trip and
@@ -1056,7 +1194,7 @@ async def bond_redeem(interaction: discord.Interaction, bond_id: int):
     # applied to nothing and simply destroyed.
     async with _user_lock(interaction.user.id):
         if bdb.get_bond(bond_id)["status"] != "active":
-            await interaction.followup.send("❌ That bond has already been redeemed.", ephemeral=True)
+            await interaction.followup.send("That bond has already been redeemed.", ephemeral=True)
             return
 
         # A bond payout is money the bank is already holding, so overdue debt is
@@ -1068,7 +1206,7 @@ async def bond_redeem(interaction: discord.Interaction, bond_id: int):
         to_wallet = amount - garnish
 
         if not bdb.claim_bond(bond_id):
-            await interaction.followup.send("❌ That bond has already been redeemed.", ephemeral=True)
+            await interaction.followup.send("That bond has already been redeemed.", ephemeral=True)
             return
 
         res = None
@@ -1100,26 +1238,35 @@ async def bond_redeem(interaction: discord.Interaction, bond_id: int):
         bdb.finalize_bond_redemption(bond_id, amount, now.isoformat())
         bdb.log(interaction.user.id, "bond_redeem", amount, f"bond #{bond_id} {kind_note}")
 
-    body = f"Bond #{bond_id} — {kind_note}.\nPayout: **{fmt(amount)}** {COIN}\n"
+    split = [("To your wallet", ab.coins(to_wallet))]
     if applied:
-        body += (f"⚠️ **{fmt(applied)}** {COIN} went straight to your overdue debt.\n"
-                 f"Remaining debt: {fmt(bdb.total_debt(interaction.user.id))} {COIN}\n")
+        split.append(("Taken for overdue debt", ab.coins(applied)))
+        split.append(("Remaining debt", ab.coins(bdb.total_debt(interaction.user.id))))
     if shortfall > 0:
-        body += f"**{fmt(shortfall)}** {COIN} went to your savings.\n"
-    body += f"To your wallet: **{fmt(to_wallet)}** {COIN}"
+        split.append(("To your savings", ab.coins(shortfall)))
     if res:
-        body += f"\nWallet: {fmt(res['coins'])} {COIN}"
-    await interaction.followup.send(
-        embed=_embed("💵 Bond redeemed", body, color=0x9B59B6), ephemeral=True)
+        split.append(("Wallet", ab.coins(res["coins"])))
 
-    asyncio.create_task(_log_activity(
-        f"💵 {interaction.user.mention} redeemed bond #{bond_id} for **{fmt(amount)}** {COIN} "
-        f"({kind_note})."
-        + (f" **{fmt(applied)}** {COIN} garnished against overdue debt." if applied else "")))
+    await interaction.followup.send(
+        # Green only where coins actually reached the reader.
+        embed=ab.embed(title=f"Bond redeemed #{bond_id}",
+                       kicker="/bond redeem",
+                       desc=(f"{bond['term_days']} day term — {kind_note}."),
+                       band=[("Payout", ab.coins(amount)),
+                             ("Term", f"{bond['term_days']} days")],
+                       groups=[("Where it went", ab.rows(split, strong="To your wallet"))],
+                       colour=ab.GAIN if to_wallet > 0 else ab.ACCENT),
+        ephemeral=True)
+
+    asyncio.create_task(_log_activity(ab.line(
+        "Bond redeemed", f"#{bond_id}", interaction.user.mention, ab.coins(amount),
+        f"{bond['term_days']} day term", kind_note,
+        f"{ab.coins(applied)} taken against overdue debt" if applied else "")))
 
 
 
 invest_group = app_commands.Group(name="invest", description="Trade stocks on the Restocker exchange")
+
 
 
 async def _market_autocomplete(interaction: discord.Interaction, current: str):
@@ -1132,13 +1279,179 @@ async def _market_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower()
     out = []
     for m in markets:
-        label = f"{m['name']} ({m['market_id']}) — {m['price']:,.2f}"
+        label = f"{m['name']} ({m['market_id']}) — {ab.coins(m['price'], 2)} per share"
         if cur in m["market_id"].lower() or cur in m["name"].lower():
             out.append(app_commands.Choice(name=label[:100], value=m["market_id"]))
     return out[:25]
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Trading: quote, then confirm, then trade
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `/invest buy` used to execute on the first click, with no price shown and no
+# bound on the fill. The price moves with each trade, so what a member paid was
+# whatever the market happened to be when the request landed — they agreed to a
+# share count and found out the cost afterwards.
+#
+# Now: quote the price, show what it costs, and execute only on a second,
+# deliberate click, with the quote attached. Core refuses `slippage` before
+# anything moves if the market has run past the bound, and that refusal releases
+# the key so a fresh quote goes straight through.
+
+#: How far the fill may drift from the quoted price before core refuses it.
+#: 200 bps = 2%. A tighter bound refuses more often on a thin market; a looser
+#: one is decoration.
+INVEST_MAX_SLIPPAGE_BPS = int(os.getenv("INVEST_MAX_SLIPPAGE_BPS", "200"))
+
+
+async def _quote_for(interaction: discord.Interaction, market_id: str):
+    """The current price of one market, from the same list `/invest list` shows."""
+    markets = await _safe(interaction, client_rs.list_stocks())
+    if markets is None:
+        return None
+    for m in markets:
+        if str(m.get("market_id")) == str(market_id):
+            return m
+    await interaction.followup.send(
+        f"{market_id} is not a public market. Use /invest list to see what is.",
+        ephemeral=True)
+    return None
+
+
+class _TradeConfirm(discord.ui.View):
+    """Confirm a quoted trade. Only the member who asked can press it.
+
+    The idempotency key is derived from the ORIGINAL command interaction, so it is
+    the same key however many times Confirm is pressed: a double-click replays the
+    first result instead of buying twice. A generated-per-call key would only have
+    covered a transport retry, which is not the failure people actually hit.
+    """
+
+    def __init__(self, *, user_id: int, market_id: str, market_name: str,
+                 shares: int, side: str, quote_price: float, total: int,
+                 bound: int, key: str):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.market_id = market_id
+        self.market_name = market_name
+        self.shares = shares
+        self.side = side
+        self.quote_price = quote_price
+        self.total = total
+        self.bound = bound
+        self.key = key
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This quote belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        # A quote that has gone stale must not sit there looking pressable.
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            await interaction.response.send_message("Already sent.", ephemeral=True)
+            return
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        if self.side == "buy":
+            res = await _safe(interaction, client_rs.stock_buy(
+                self.user_id, self.market_id, self.shares,
+                name=interaction.user.display_name,
+                idempotency_key=self.key, quote_price=self.quote_price,
+                max_total=self.bound, max_slippage_bps=INVEST_MAX_SLIPPAGE_BPS))
+        else:
+            res = await _safe(interaction, client_rs.stock_sell(
+                self.user_id, self.market_id, self.shares,
+                name=interaction.user.display_name,
+                idempotency_key=self.key, quote_price=self.quote_price,
+                min_total=self.bound, max_slippage_bps=INVEST_MAX_SLIPPAGE_BPS))
+        if res is None:
+            return
+
+        if res.get("code") == "slippage":
+            await interaction.followup.send(
+                f"{self.market_name} moved past the price you agreed to, so nothing "
+                f"was traded. Run the command again for a fresh quote.", ephemeral=True)
+            return
+
+        if res.get("ok"):
+            kind = "stock_buy" if self.side == "buy" else "stock_sell"
+            bdb.log(self.user_id, kind, self.shares, f"{self.market_id}")
+            asyncio.create_task(_log_activity(ab.line(
+                "Shares bought" if self.side == "buy" else "Shares sold",
+                self.market_name, f"{self.shares:,} shares", interaction.user.mention)))
+        await interaction.followup.send(res.get("message", "Done."), ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("Nothing was traded.", ephemeral=True)
+
+
+async def _quote_then_confirm(interaction: discord.Interaction, market: str,
+                              shares: int, *, side: str) -> None:
+    """Show the price and the total, then wait for a second click."""
+    if not await ensure_account(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    quote = await _quote_for(interaction, market)
+    if quote is None:
+        return
+
+    price = float(quote.get("price") or 0)
+    name = quote.get("name") or market
+    total = int(round(price * shares))
+    slip = INVEST_MAX_SLIPPAGE_BPS / 10_000.0
+    # The bound is on the coin figure the member agreed to, in their own
+    # direction: a buyer is protected from paying more, a seller from receiving
+    # less.
+    bound = int(round(total * (1 + slip))) if side == "buy" else int(round(total * (1 - slip)))
+    key = f"invest:{side}:{interaction.id}"
+
+    view = _TradeConfirm(user_id=interaction.user.id, market_id=market,
+                         market_name=name, shares=shares, side=side,
+                         quote_price=price, total=total, bound=bound, key=key)
+    verb = "pay" if side == "buy" else "receive"
+    await interaction.followup.send(
+        embed=ab.embed(
+            title=f"{'Buy' if side == 'buy' else 'Sell'} {shares:,} "
+                  f"share{'' if shares == 1 else 's'} of {name}",
+            kicker=f"/invest {side}",
+            desc=f"At {ab.coins(price, 2)} a share you {verb} about "
+                 f"{ab.coins(total)}.",
+            band=[("Shares", f"{shares:,}"),
+                  ("Quoted price", ab.coins(price, 2)),
+                  ("About", ab.coins(total))],
+            groups=[("What happens next", ab.rows([
+                ("Price moves with each trade",
+                 f"refused if it drifts more than {INVEST_MAX_SLIPPAGE_BPS / 100:g}%"),
+                ("You " + verb + " at most" if side == "buy"
+                 else "You receive at least", ab.coins(bound)),
+            ]))],
+            foot="This quote expires in 60 seconds.",
+            colour=ab.ACCENT),
+        view=view, ephemeral=True)
+
+
 @invest_group.command(name="list", description="List public markets you can invest in")
+
 async def invest_list(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     markets = await _safe(interaction, client_rs.list_stocks())
@@ -1147,51 +1460,37 @@ async def invest_list(interaction: discord.Interaction):
     if not markets:
         await interaction.followup.send("No public markets right now.", ephemeral=True)
         return
-    lines = [f"**{m['name']}** `{m['market_id']}` — {m['price']:,.2f} {COIN}/share "
-             f"(P/E {m['pe']:.1f})" for m in markets]
+    rows = [(f"{m['name']} ({m['market_id']})",
+             f"{ab.coins(m['price'], 2)} per share · P/E {ab.multiple(m['pe'], 1)}")
+            for m in markets]
     await interaction.followup.send(
-        embed=_embed("📈 Public markets", "\n".join(lines)), ephemeral=True)
+        embed=ab.embed(title="Public markets",
+                       kicker="/invest list",
+                       groups=[("Markets", ab.rows(rows))],
+                       colour=ab.NEUTRAL),
+        ephemeral=True)
 
 
 @invest_group.command(name="buy", description="Buy shares (paid from your wallet)")
 @app_commands.describe(market="The market to invest in", shares="How many shares")
 @app_commands.autocomplete(market=_market_autocomplete)
+
 async def invest_buy(interaction: discord.Interaction, market: str,
                      shares: app_commands.Range[int, 1, 1_000_000]):
-    if not await ensure_account(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    res = await _safe(interaction, client_rs.stock_buy(
-        interaction.user.id, market, shares, name=interaction.user.display_name))
-    if res is None:
-        return
-    if res.get("ok"):
-        bdb.log(interaction.user.id, "stock_buy", shares, f"{market}")
-        asyncio.create_task(_log_activity(
-            f"📈 {interaction.user.mention} bought {shares} shares of `{market}`."))
-    await interaction.followup.send(res.get("message", "Done."), ephemeral=True)
+    await _quote_then_confirm(interaction, market, int(shares), side="buy")
 
 
 @invest_group.command(name="sell", description="Sell shares back to the market")
 @app_commands.describe(market="The market you hold", shares="How many shares")
 @app_commands.autocomplete(market=_market_autocomplete)
+
 async def invest_sell(interaction: discord.Interaction, market: str,
                       shares: app_commands.Range[int, 1, 1_000_000]):
-    if not await ensure_account(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    res = await _safe(interaction, client_rs.stock_sell(
-        interaction.user.id, market, shares, name=interaction.user.display_name))
-    if res is None:
-        return
-    if res.get("ok"):
-        bdb.log(interaction.user.id, "stock_sell", shares, f"{market}")
-        asyncio.create_task(_log_activity(
-            f"📉 {interaction.user.mention} sold {shares} shares of `{market}`."))
-    await interaction.followup.send(res.get("message", "Done."), ephemeral=True)
+    await _quote_then_confirm(interaction, market, int(shares), side="sell")
 
 
 @invest_group.command(name="portfolio", description="See your stock holdings")
+
 async def invest_portfolio(interaction: discord.Interaction):
     if not await ensure_account(interaction, write=False):
         return
@@ -1202,16 +1501,20 @@ async def invest_portfolio(interaction: discord.Interaction):
     if not holdings:
         await interaction.followup.send("You don't hold any shares yet.", ephemeral=True)
         return
-    lines, total = [], 0.0
+    rows, total = [], 0.0
     for h in holdings:
         total += h["value"]
         pl = h["value"] - h["cost_basis"]
-        arrow = "🟢" if pl >= 0 else "🔴"
-        lines.append(f"**{h['market_id']}**: {h['shares']:,.0f} @ {h['price']:,.2f} "
-                     f"= {h['value']:,.0f} {COIN} {arrow} {pl:+,.0f}")
+        rows.append((h["market_id"],
+                     f"{h['shares']:,.0f} shares at {ab.coins(h['price'], 2)} per share "
+                     f"= {ab.coins(h['value'])} ({ab.signed(pl)})"))
     await interaction.followup.send(
-        embed=_embed("📊 Your portfolio",
-                     "\n".join(lines) + f"\n\n**Total value: {fmt(total)} {COIN}**"),
+        embed=ab.embed(title="Your portfolio",
+                       kicker="/invest portfolio",
+                       band=[("Total value", ab.coins(total)),
+                             ("Markets held", str(len(holdings)))],
+                       groups=[("Holdings", ab.rows(rows))],
+                       colour=ab.ACCENT),
         ephemeral=True,
     )
 
@@ -1222,6 +1525,7 @@ admin_group = app_commands.Group(name="admin", description="Lead Banker tools")
 
 @admin_group.command(name="account", description="Inspect any member's bank account")
 @app_commands.describe(member="Whose account to look at")
+
 async def admin_account(interaction: discord.Interaction, member: discord.Member):
     if not await ensure_banker(interaction):
         return
@@ -1238,42 +1542,53 @@ async def admin_account(interaction: discord.Interaction, member: discord.Member
     pending = bdb.get_pending_loans(member.id)
     overdue = [l for l in bdb.overdue_loans() if str(l["user_id"]) == str(member.id)]
 
-    wallet = "—"
+    wallet = "Unknown"
     if client_rs is not None:
         try:
-            wallet = f"{fmt((await client_rs.get_balance(member.id))['coins'])} {COIN}"
+            wallet = ab.coins((await client_rs.get_balance(member.id))["coins"])
         except RestockerError as e:
-            wallet = f"⚠️ {e}"
+            wallet = f"Unavailable: {e}"
 
-    status = "🟢 open" if acct["opted_in"] else "🔒 closed"
+    status = "Open" if acct["opted_in"] else "Closed"
     if acct.get("frozen"):
-        status += f" · 🧊 FROZEN ({acct.get('frozen_reason') or 'no reason given'})"
+        status += f" · frozen ({acct.get('frozen_reason') or 'no reason given'})"
 
-    e = _embed(f"🔍 {member.display_name}", f"`{member.id}` · {status}", color=0x3498DB)
-    e.add_field(name="Wallet", value=wallet, inline=True)
-    e.add_field(name="Savings", value=f"{fmt(sav)} {COIN}", inline=True)
-    e.add_field(name="Bonds", value=f"{fmt(bonds)} {COIN}", inline=True)
-    e.add_field(name="Debt", value=f"{fmt(debt)} {COIN}", inline=True)
-    e.add_field(name="Credit limit",
-                value=f"{fmt(credit_limit_for(member.id))} {COIN}"
-                      + (" *(override)*" if acct.get("credit_limit") is not None else ""),
-                inline=True)
-    e.add_field(name="Overdue loans", value=str(len(overdue)), inline=True)
-    e.add_field(name="Track record",
-                value=(f"repaid {hist['repaid_count']} · late {hist['late_count']} · "
-                       f"written off {hist['written_off_count']} · denied {hist['denied_count']}"),
-                inline=False)
+    opened = _parse_iso(str(acct["created_at"]))
+    groups = [("Holdings", ab.rows([
+                  ("Wallet", wallet),
+                  ("Savings", ab.coins(sav)),
+                  ("Bonds, value at maturity", ab.coins(bonds)),
+              ])),
+              ("Lending", ab.rows([
+                  ("Debt", ab.coins(debt)),
+                  ("Credit limit", ab.coins(credit_limit_for(member.id))
+                                   + (" (override)" if acct.get("credit_limit") is not None else "")),
+                  ("Overdue loans", len(overdue)),
+                  ("Repaid", hist["repaid_count"]),
+                  ("Late", hist["late_count"]),
+                  ("Written off", hist["written_off_count"]),
+                  ("Denied", hist["denied_count"]),
+              ], strong="Debt"))]
     if pending:
-        e.add_field(name="Awaiting approval",
-                    value="\n".join(f"#{p['id']} — {fmt(p['principal'])} {COIN} ({p['term_days']}d)"
-                                    for p in pending),
-                    inline=False)
-    e.add_field(name="Opened", value=str(acct["created_at"])[:10], inline=False)
+        groups.append(("Awaiting approval", ab.rows(
+            [(f"#{p['id']} · {p['term_days']} day term", ab.coins(p["principal"]))
+             for p in pending])))
+
+    e = ab.embed(title=member.display_name,
+                 kicker="/admin account",
+                 desc=f"`{member.id}` · {status}",
+                 band=[("Savings", ab.coins(sav)),
+                       ("Debt", ab.coins(debt)),
+                       ("Bonds", ab.coins(bonds))],
+                 groups=groups,
+                 foot=f"Account opened {ab.on_day(opened)}" if opened else "",
+                 colour=ab.LOSS if overdue else ab.ACCENT)
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
 @admin_group.command(name="freeze", description="Freeze an account so it can't move money")
 @app_commands.describe(member="Whose account", reason="Shown to them when they try a command")
+
 async def admin_freeze(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
     if not await ensure_banker(interaction):
         return
@@ -1284,46 +1599,50 @@ async def admin_freeze(interaction: discord.Interaction, member: discord.Member,
     bdb.set_frozen(member.id, True, reason)
     bdb.log(member.id, "account_frozen", 0, f"by {interaction.user.id}: {reason}")
     await interaction.response.send_message(
-        f"🧊 Froze {member.mention}'s account.", ephemeral=True)
-    asyncio.create_task(_log_activity(
-        f"🧊 {interaction.user.mention} froze {member.mention}'s account."
-        + (f" Reason: {reason}" if reason else "")))
+        f"Froze {member.mention}'s account.", ephemeral=True)
+    asyncio.create_task(_log_activity(ab.line(
+        "Account frozen", member.mention, f"by {interaction.user.mention}",
+        f"reason: {reason}" if reason else "")))
 
 
 @admin_group.command(name="unfreeze", description="Lift a freeze")
 @app_commands.describe(member="Whose account")
+
 async def admin_unfreeze(interaction: discord.Interaction, member: discord.Member):
     if not await ensure_banker(interaction):
         return
     bdb.set_frozen(member.id, False)
     bdb.log(member.id, "account_unfrozen", 0, f"by {interaction.user.id}")
     await interaction.response.send_message(
-        f"🔓 Unfroze {member.mention}'s account.", ephemeral=True)
-    asyncio.create_task(_log_activity(
-        f"🔓 {interaction.user.mention} unfroze {member.mention}'s account."))
+        f"Unfroze {member.mention}'s account.", ephemeral=True)
+    asyncio.create_task(_log_activity(ab.line(
+        "Account unfrozen", member.mention, f"by {interaction.user.mention}")))
 
 
 @admin_group.command(name="creditlimit", description="Override how much a member may borrow")
 @app_commands.describe(member="Whose limit", limit="New limit, or -1 to clear the override")
+
 async def admin_creditlimit(interaction: discord.Interaction, member: discord.Member,
                             limit: app_commands.Range[int, -1, 100_000_000]):
     if not await ensure_banker(interaction):
         return
     if limit < 0:
         bdb.set_credit_limit(member.id, None)
-        msg = (f"↩️ Cleared {member.mention}'s override — back to the earned limit "
-               f"(**{fmt(credit_limit_for(member.id))}** {COIN}).")
+        msg = (f"Cleared {member.mention}'s override — back to the earned limit of "
+               f"{ab.coins(credit_limit_for(member.id))}.")
     else:
         bdb.set_credit_limit(member.id, limit)
-        msg = f"💳 Set {member.mention}'s credit limit to **{fmt(limit)}** {COIN}."
+        msg = f"Set {member.mention}'s credit limit to {ab.coins(limit)}."
     bdb.log(member.id, "credit_limit_set", max(0, limit), f"by {interaction.user.id}")
     await interaction.response.send_message(msg, ephemeral=True)
-    asyncio.create_task(_log_activity(f"💳 {interaction.user.mention}: {msg}"))
+    asyncio.create_task(_log_activity(ab.line(
+        "Credit limit", f"set by {interaction.user.mention}", msg)))
 
 
 @admin_group.command(name="savings", description="Adjust a member's savings (corrections, fines, payouts)")
 @app_commands.describe(member="Whose savings", amount="Positive to credit, negative to debit",
                        reason="Why — goes in the ledger")
+
 async def admin_savings(interaction: discord.Interaction, member: discord.Member,
                         amount: app_commands.Range[int, -100_000_000, 100_000_000],
                         reason: str):
@@ -1339,23 +1658,24 @@ async def admin_savings(interaction: discord.Interaction, member: discord.Member
     if amount < 0 and not bdb.try_debit_savings(member.id, -amount):
         cur = bdb.get_savings(member.id)["balance"]
         await interaction.response.send_message(
-            f"❌ They only have {fmt(cur)} {COIN} in savings.", ephemeral=True)
+            f"They only have {ab.coins(cur)} in savings.", ephemeral=True)
         return
     if amount > 0:
         bdb.add_savings(member.id, amount)
     new = bdb.get_savings(member.id)["balance"]
     bdb.log(member.id, "admin_savings_adjust", amount, f"by {interaction.user.id}: {reason}")
     await interaction.response.send_message(
-        f"✅ {'Credited' if amount > 0 else 'Debited'} **{fmt(abs(amount))}** {COIN} "
-        f"{'to' if amount > 0 else 'from'} {member.mention}'s savings. New balance: "
-        f"**{fmt(new)}** {COIN}.", ephemeral=True)
-    asyncio.create_task(_log_activity(
-        f"🛠️ {interaction.user.mention} adjusted {member.mention}'s savings by "
-        f"**{amount:+,}** {COIN} — {reason}"))
+        f"{'Credited' if amount > 0 else 'Debited'} {ab.coins(abs(amount))} "
+        f"{'to' if amount > 0 else 'from'} {member.mention}'s savings. "
+        f"New balance: {ab.coins(new)}.", ephemeral=True)
+    asyncio.create_task(_log_activity(ab.line(
+        "Savings adjusted", member.mention, ab.signed(amount),
+        f"by {interaction.user.mention}", reason)))
 
 
 @admin_group.command(name="forgive", description="Write off a loan (the debt disappears, no coins move)")
 @app_commands.describe(member="Whose loan", loan_id="Loan number, or omit to forgive all their debt")
+
 async def admin_forgive(interaction: discord.Interaction, member: discord.Member,
                         loan_id: int | None = None):
     if not await ensure_banker(interaction):
@@ -1368,7 +1688,7 @@ async def admin_forgive(interaction: discord.Interaction, member: discord.Member
             l = bdb.get_loan(loan_id)
             if not l or str(l["user_id"]) != str(member.id):
                 await interaction.followup.send(
-                    f"❌ Loan #{loan_id} isn't {member.display_name}'s.", ephemeral=True)
+                    f"Loan #{loan_id} isn't {member.display_name}'s.", ephemeral=True)
                 return
             targets = [l]
         if not targets:
@@ -1387,33 +1707,44 @@ async def admin_forgive(interaction: discord.Interaction, member: discord.Member
         await interaction.followup.send("Nothing to forgive — those loans aren't active.", ephemeral=True)
         return
     await interaction.followup.send(
-        f"🩹 Wrote off **{fmt(wiped)}** {COIN} for {member.mention} "
-        f"(loan{'s' if len(ids) > 1 else ''} {', '.join('#' + str(i) for i in ids)}).\n"
-        f"Note: a written-off loan drops their earned credit limit to 0 until you set "
-        f"an override with `/admin creditlimit`.", ephemeral=True)
-    asyncio.create_task(_log_activity(
-        f"🩹 {interaction.user.mention} wrote off **{fmt(wiped)}** {COIN} of "
-        f"{member.mention}'s debt."))
+        embed=ab.embed(title="Loans written off",
+                       kicker="/admin forgive",
+                       desc=(f"Wrote off {ab.coins(wiped)} for {member.mention} "
+                             f"(loan{'s' if len(ids) > 1 else ''} "
+                             f"{', '.join('#' + str(i) for i in ids)})."),
+                       foot=("A written-off loan drops their earned credit limit to 0 "
+                             "until an override is set with /admin creditlimit."),
+                       colour=ab.LOSS),
+        ephemeral=True)
+    asyncio.create_task(_log_activity(ab.line(
+        "Debt written off", member.mention, ab.coins(wiped),
+        f"by {interaction.user.mention}")))
 
 
 @admin_group.command(name="loans", description="Loan requests waiting for a decision")
+
+
 async def admin_loans(interaction: discord.Interaction):
     if not await ensure_banker(interaction):
         return
     pending = bdb.get_pending_loans()
     if not pending:
-        await interaction.response.send_message("No loan requests pending. 🎉", ephemeral=True)
+        await interaction.response.send_message("No loan requests pending.", ephemeral=True)
         return
-    lines = [f"#{p['id']} — <@{p['user_id']}> · **{fmt(p['principal'])}** {COIN} · "
-             f"{p['term_days']}d · asked {str(p['requested_at'])[:10]}"
-             for p in pending[:25]]
-    extra = f"\n…and {len(pending) - 25} more." if len(pending) > 25 else ""
+    rows = []
+    for p in pending[:25]:
+        asked = _parse_iso(str(p["requested_at"]))
+        rows.append((f"#{p['id']} · <@{p['user_id']}> · {p['term_days']} day term",
+                     ab.line(ab.coins(p["principal"]),
+                             f"asked {ab.when(asked)}" if asked else "")))
+    foot = (f"Showing 25 of {len(pending)}. " if len(pending) > 25 else "")
     await interaction.response.send_message(
-        embed=_embed("🕒 Pending loan requests",
-                     "\n".join(lines) + extra
-                     + "\n\nDecide with `/admin approve` / `/admin deny`, or the buttons "
-                       "on the proposal message.",
-                     color=0xF1C40F),
+        embed=ab.embed(title="Pending loan requests",
+                       kicker="/admin loans",
+                       groups=[("Requests", ab.rows(rows))],
+                       foot=foot + "Decide with /admin approve, /admin deny, or the "
+                                   "buttons on the proposal message.",
+                       colour=ab.NEUTRAL),
         ephemeral=True)
 
 
@@ -1434,36 +1765,41 @@ async def admin_deny(interaction: discord.Interaction, loan_id: int):
 
 
 @admin_group.command(name="overdue", description="Everyone currently in default")
+
 async def admin_overdue(interaction: discord.Interaction):
     if not await ensure_banker(interaction):
         return
     loans = bdb.overdue_loans()
     if not loans:
-        await interaction.response.send_message("Nobody is overdue. 🎉", ephemeral=True)
+        await interaction.response.send_message("Nobody is overdue.", ephemeral=True)
         return
-    now = utcnow()
-    lines, total = [], 0.0
+    rows, total = [], 0.0
     for l in loans[:25]:
         due = _parse_iso(l["due_at"])
-        late = (now - due).days if due else 0
         total += float(l["balance"])
         sav = bdb.get_savings(l["user_id"])["balance"]
-        lines.append(f"#{l['id']} <@{l['user_id']}> — **{fmt(l['balance'])}** {COIN} · "
-                     f"{late}d late · savings {fmt(sav)} {COIN}")
-    extra = f"\n…and {len(loans) - 25} more." if len(loans) > 25 else ""
+        term = f"{l['term_days']} day term" if l.get("term_days") else "term not recorded"
+        rows.append((f"#{l['id']} · <@{l['user_id']}> · {term}",
+                     f"{ab.coins(l['balance'])} owed · due {ab.when(due) if due else 'unknown'} "
+                     f"· savings {ab.coins(sav)}"))
+    foot = (f"Showing 25 of {len(loans)}. " if len(loans) > 25 else "")
+    foot += (f"Savings are collected automatically {COLLECT_GRACE_DAYS:g} days past due; "
+             f"wallets are never touched."
+             if COLLECT_FROM_SAVINGS else
+             "Automatic collection is off (COLLECT_FROM_SAVINGS=0).")
     await interaction.response.send_message(
-        embed=_embed("⚠️ Overdue loans",
-                     "\n".join(lines) + extra
-                     + f"\n\n**Total overdue: {fmt(total)} {COIN}** across {len(loans)} loan(s)."
-                     + (f"\nSavings are seized automatically after "
-                        f"{COLLECT_GRACE_DAYS:g} days overdue."
-                        if COLLECT_FROM_SAVINGS else
-                        "\nAutomatic collection is **off** (`COLLECT_FROM_SAVINGS=0`)."),
-                     color=0xE74C3C),
+        embed=ab.embed(title="Overdue loans",
+                       kicker="/admin overdue",
+                       band=[("Total overdue", ab.coins(total)),
+                             ("Loans", str(len(loans)))],
+                       groups=[("Loans", ab.rows(rows))],
+                       foot=foot,
+                       colour=ab.LOSS),
         ephemeral=True)
 
 
 @admin_group.command(name="collect", description="Run the collections pass right now")
+
 async def admin_collect(interaction: discord.Interaction):
     if not await ensure_banker(interaction):
         return
@@ -1473,16 +1809,23 @@ async def admin_collect(interaction: discord.Interaction):
         await run_collections()
     except Exception as e:
         log.exception("Manual collections pass failed")
-        await interaction.followup.send(f"❌ Collections failed: {e}", ephemeral=True)
+        await interaction.followup.send(f"Collections failed: {e}", ephemeral=True)
         return
     after = sum(float(l["balance"]) for l in bdb.overdue_loans())
     await interaction.followup.send(
-        f"🏛️ Collections done. Overdue debt {fmt(before)} → **{fmt(after)}** {COIN} "
-        f"(recovered {fmt(max(0.0, before - after))} {COIN}).", ephemeral=True)
+        embed=ab.embed(title="Collections run",
+                       kicker="/admin collect",
+                       band=[("Before", ab.coins(before)),
+                             ("After", ab.coins(after)),
+                             ("Recovered", ab.coins(max(0.0, before - after)))],
+                       foot="Taken from savings only, never from wallets.",
+                       colour=ab.ACCENT),
+        ephemeral=True)
 
 
 @admin_group.command(name="close", description="Force-close a member's account")
 @app_commands.describe(member="Whose account", reason="Why")
+
 async def admin_close(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
     if not await ensure_banker(interaction):
         return
@@ -1493,80 +1836,103 @@ async def admin_close(interaction: discord.Interaction, member: discord.Member, 
     debt = bdb.total_debt(member.id)
     if debt > 0:
         await interaction.response.send_message(
-            f"❌ {member.mention} still owes **{fmt(debt)}** {COIN}. Collect or "
-            f"`/admin forgive` it first.", ephemeral=True)
+            f"{member.mention} still owes {ab.coins(debt)}. Collect or `/admin forgive` "
+            f"it first.", ephemeral=True)
         return
     bdb.close_account(member.id)
     bdb.log(member.id, "account_closed", 0, f"forced by {interaction.user.id}: {reason}")
     sav = bdb.get_savings(member.id)["balance"]
-    note = (f"\n⚠️ They still have **{fmt(sav)}** {COIN} in savings and "
+    note = (f" They still have {ab.coins(sav)} in savings and "
             f"{len(bdb.get_bonds(member.id, 'active'))} active bond(s) — reopening the "
             f"account with `/bank open` restores access to them." if sav > 0 else "")
     await interaction.response.send_message(
-        f"🔒 Closed {member.mention}'s account.{note}", ephemeral=True)
-    asyncio.create_task(_log_activity(
-        f"🔒 {interaction.user.mention} force-closed {member.mention}'s account."
-        + (f" Reason: {reason}" if reason else "")))
+        f"Closed {member.mention}'s account.{note}", ephemeral=True)
+    asyncio.create_task(_log_activity(ab.line(
+        "Account force-closed", member.mention, f"by {interaction.user.mention}",
+        f"reason: {reason}" if reason else "")))
 
 
 @admin_group.command(name="stats", description="Bank-wide totals")
+
 async def admin_stats(interaction: discord.Interaction):
     if not await ensure_banker(interaction):
         return
     s = bdb.bank_stats()
-    e = _embed("🏦 Bank of Osentar — books", color=0x3498DB)
-    e.add_field(name="Accounts",
-                value=f"{s['accounts_open']} open · {s['accounts_closed']} closed · "
-                      f"{s['accounts_frozen']} frozen", inline=False)
-    e.add_field(name="Savings held", value=f"{fmt(s['savings_total'])} {COIN}", inline=True)
-    e.add_field(name="Bonds locked", value=f"{fmt(s['bonds_locked'])} {COIN}", inline=True)
-    e.add_field(name="Bond liability", value=f"{fmt(s['bonds_payout'])} {COIN}", inline=True)
-    e.add_field(name="Loans out",
-                value=f"{fmt(s['debt_total'])} {COIN} ({s['loans_active']} active)", inline=True)
-    e.add_field(name="Pending requests", value=str(s["loans_pending"]), inline=True)
-    e.add_field(name="Written off", value=f"{fmt(s['written_off_total'])} {COIN}", inline=True)
     overdue = bdb.overdue_loans()
-    e.add_field(name="Overdue",
-                value=f"{fmt(sum(float(l['balance']) for l in overdue))} {COIN} "
-                      f"({len(overdue)} loan(s))", inline=False)
     # What the bank owes depositors vs what it's owed back.
     liabilities = float(s["savings_total"]) + float(s["bonds_payout"])
     assets = float(s["debt_total"])
-    e.add_field(name="Position",
-                value=f"Owed to members {fmt(liabilities)} {COIN} · owed to bank {fmt(assets)} {COIN} "
-                      f"· **net {fmt(assets - liabilities)}** {COIN}", inline=False)
+    e = ab.embed(
+        title="Bank of Osentar books",
+        kicker="/admin stats",
+        band=[("Savings held", ab.coins(s["savings_total"])),
+              ("Loans out", ab.coins(s["debt_total"])),
+              ("Overdue", ab.coins(sum(float(l["balance"]) for l in overdue)))],
+        groups=[("Accounts", ab.rows([
+                    ("Open", s["accounts_open"]),
+                    ("Closed", s["accounts_closed"]),
+                    ("Frozen", s["accounts_frozen"]),
+                ])),
+                ("Bonds", ab.rows([
+                    ("Principal locked", ab.coins(s["bonds_locked"])),
+                    ("Payout liability", ab.coins(s["bonds_payout"])),
+                ])),
+                ("Lending", ab.rows([
+                    ("Active loans", s["loans_active"]),
+                    ("Pending requests", s["loans_pending"]),
+                    ("Overdue loans", len(overdue)),
+                    ("Written off", ab.coins(s["written_off_total"])),
+                ])),
+                ("Position", ab.rows([
+                    ("Owed to members", ab.coins(liabilities)),
+                    ("Owed to the bank", ab.coins(assets)),
+                    ("Net", ab.coins(assets - liabilities)),
+                ], strong="Net"))],
+        colour=ab.ACCENT)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 @admin_group.command(name="config", description="Show the bank's effective settings")
+
 async def admin_config(interaction: discord.Interaction):
     if not await ensure_banker(interaction):
         return
-    terms = ", ".join(f"{d}d@{a*100:.1f}%" for d, a in BOND_TERMS.items()) or "none"
-    e = _embed("⚙️ Effective config", color=0x95A5A6)
-    e.add_field(name="Rates",
-                value=f"Savings {SAVINGS_APR*100:.2f}% · Loan {LOAN_APR*100:.2f}% "
-                      f"(+{LOAN_OVERDUE_EXTRA_APR*100:.0f}% overdue)", inline=False)
-    e.add_field(name="Lending",
-                value=f"Approval gate **{'ON' if LOAN_REQUIRE_APPROVAL else 'OFF'}** · "
-                      f"base limit {fmt(BASE_CREDIT_LIMIT)} +{fmt(CREDIT_PER_REPAID_LOAN)}/repaid "
-                      f"−{fmt(CREDIT_LATE_PENALTY)}/late · hard cap {fmt(MAX_LOAN)}", inline=False)
-    e.add_field(name="Collections",
-                value=f"Seize savings **{'ON' if COLLECT_FROM_SAVINGS else 'OFF'}** after "
-                      f"{COLLECT_GRACE_DAYS:g}d · garnish bonds "
-                      f"**{'ON' if GARNISH_BOND_PAYOUTS else 'OFF'}** · announce "
-                      f"**{'ON' if OVERDUE_ANNOUNCE else 'OFF'}**", inline=False)
-    e.add_field(name="Bonds", value=f"{terms} · early penalty {BOND_EARLY_PENALTY_PCT*100:.0f}%",
-                inline=False)
-    e.add_field(name="Staff",
-                value=f"{len(LEAD_BANKER_ROLE_IDS)} role(s), {len(BANK_ADMIN_USER_IDS)} user(s) "
-                      f"allow-listed"
-                      + ("\n⚠️ Neither is set — falling back to server Administrators."
-                         if not (LEAD_BANKER_ROLE_IDS or BANK_ADMIN_USER_IDS) else ""),
-                inline=False)
-    e.add_field(name="Restocker",
-                value=(f"`{RESTOCKER_API_URL}`" if RESTOCKER_API_URL else "⚠️ not configured"),
-                inline=False)
+    terms = ", ".join(f"{d} day at {a*100:.1f}% APR" for d, a in BOND_TERMS.items()) or "none"
+    staff = (f"{len(LEAD_BANKER_ROLE_IDS)} role(s), {len(BANK_ADMIN_USER_IDS)} user(s) allow-listed"
+             if (LEAD_BANKER_ROLE_IDS or BANK_ADMIN_USER_IDS)
+             else "Neither set — falling back to server Administrators")
+    e = ab.embed(
+        title="Effective config",
+        kicker="/admin config",
+        groups=[("Rates", ab.rows([
+                    ("Savings APR", f"{SAVINGS_APR*100:.2f}%"),
+                    ("Loan APR", f"{LOAN_APR*100:.2f}%"),
+                    ("Overdue surcharge", f"+{LOAN_OVERDUE_EXTRA_APR*100:.0f}% APR"),
+                ])),
+                ("Lending", ab.rows([
+                    ("Approval gate", "on" if LOAN_REQUIRE_APPROVAL else "off"),
+                    ("Base credit limit", ab.coins(BASE_CREDIT_LIMIT)),
+                    ("Per repaid loan", ab.signed(CREDIT_PER_REPAID_LOAN)),
+                    ("Per late loan", ab.signed(-CREDIT_LATE_PENALTY)),
+                    ("Hard cap", ab.coins(MAX_LOAN)),
+                    ("Default term", f"{DEFAULT_LOAN_DAYS} days"),
+                ])),
+                ("Collections", ab.rows([
+                    ("Take from savings", "on" if COLLECT_FROM_SAVINGS else "off"),
+                    ("Grace before savings are taken", f"{COLLECT_GRACE_DAYS:g} days"),
+                    ("Take from bond payouts", "on" if GARNISH_BOND_PAYOUTS else "off"),
+                    ("Announce overdue", "on" if OVERDUE_ANNOUNCE else "off"),
+                    ("Wallets", "never touched"),
+                ])),
+                ("Bonds", ab.rows([
+                    ("Terms", terms),
+                    ("Early redemption penalty", f"{BOND_EARLY_PENALTY_PCT*100:.0f}%"),
+                ])),
+                ("Access", ab.rows([
+                    ("Staff", staff),
+                    ("Restocker", RESTOCKER_API_URL or "not configured"),
+                ]))],
+        colour=ab.NEUTRAL)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -1597,6 +1963,7 @@ def _apply_to_overdue(user_id, amount: float, meta: str) -> float:
     return applied
 
 
+
 async def run_collections():
     """Chase overdue loans.
 
@@ -1619,9 +1986,13 @@ async def run_collections():
         loan_id = loan["id"]
 
         if OVERDUE_ANNOUNCE and bdb.mark_overdue_notified(loan_id):
-            await _log_activity(
-                f"⚠️ Loan #{loan_id} for <@{uid}> is **OVERDUE** — {fmt(loan['balance'])} {COIN} "
-                f"owed, was due {str(loan['due_at'])[:10]}. Penalty APR now applies.")
+            due_dt = _parse_iso(loan["due_at"])
+            await _log_activity(ab.line(
+                "Overdue", f"loan #{loan_id}", f"<@{uid}>",
+                f"{ab.coins(loan['balance'])} owed",
+                f"{loan['term_days']} day term" if loan.get("term_days") else "",
+                f"was due {ab.when(due_dt)}" if due_dt else "",
+                "penalty APR now applies"))
 
         if not COLLECT_FROM_SAVINGS:
             continue
@@ -1645,9 +2016,9 @@ async def run_collections():
             left = bdb.total_debt(uid)
 
         log.info("[collections] seized %s from savings of %s for loan #%s", take, uid, loan_id)
-        await _log_activity(
-            f"🏛️ Collected **{fmt(take)}** {COIN} from <@{uid}>'s savings against overdue "
-            f"loan #{loan_id}. Remaining debt: {fmt(left)} {COIN}.")
+        await _log_activity(ab.line(
+            "Collected", f"loan #{loan_id}", f"<@{uid}>", ab.coins(take), "from savings",
+            f"remaining debt {ab.coins(left)}"))
 
 
 @tasks.loop(hours=1)
